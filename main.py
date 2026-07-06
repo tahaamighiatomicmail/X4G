@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import hashlib
+import ipaddress
 import secrets
 import time
 import aiofiles
@@ -45,7 +46,7 @@ DATA_FILE = DATA_DIR / "x4g_state.json"
 SAVE_LOCK = asyncio.Lock()
 
 async def load_state():
-    global LINKS, AUTH, SUBS
+    global LINKS, AUTH, SUBS, CLEAN_IPS
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -54,9 +55,11 @@ async def load_state():
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
+            CLEAN_IPS.clear()
+            CLEAN_IPS.extend(data.get("clean_ips", []))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
+            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(CLEAN_IPS)} clean ips")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
@@ -67,6 +70,7 @@ async def save_state():
             data = {
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
+                "clean_ips": list(CLEAN_IPS),
                 "password_hash": AUTH["password_hash"],
                 "saved_at": datetime.now().isoformat(),
             }
@@ -93,6 +97,8 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
+CLEAN_IPS: list = []
+CLEAN_IPS_LOCK = asyncio.Lock()
 
 # پروتکل‌های پشتیبانی‌شده برای هر کانفیگ
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
@@ -200,9 +206,12 @@ def generate_vless_link(
     fingerprint: str | None = None,
     alpn: str | None = None,
     port: int | None = None,
+    address: str | None = None,
 ) -> str:
     """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP).
-    fingerprint / alpn / port در صورت ندادن، از پیش‌فرض‌های خود پروتکل استفاده می‌شوند."""
+    fingerprint / alpn / port در صورت ندادن، از پیش‌فرض‌های خود پروتکل استفاده می‌شوند.
+    address: در صورت پر بودن (مثلاً یک آی‌پی تمیز)، به‌جای host به‌عنوان آدرس اتصال (قبل از @) استفاده
+    می‌شود، ولی host همچنان برای SNI/Host header/path همون دامنه باقی می‌ماند (شبیه دامین-فرانتینگ)."""
     fp = (fingerprint or DEFAULT_FINGERPRINT).strip() or DEFAULT_FINGERPRINT
     if fp not in FINGERPRINTS:
         fp = DEFAULT_FINGERPRINT
@@ -239,7 +248,8 @@ def generate_vless_link(
             "alpn": alpn_val,
         }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{host}:{port_val}?{query}#{quote(remark)}"
+    conn_addr = (address or "").strip() or host
+    return f"vless://{uuid}@{conn_addr}:{port_val}?{query}#{quote(remark)}"
 
 def vless_link_for_link(link: dict, uid: str, host: str) -> str:
     """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه."""
@@ -252,6 +262,25 @@ def vless_link_for_link(link: dict, uid: str, host: str) -> str:
         alpn=link.get("alpn"),
         port=link.get("port"),
     )
+
+def vless_link_variants_for_link(link: dict, uid: str, host: str) -> list[str]:
+    """همه‌ی کانفیگ‌های قابل ساخت برای این لینک را برمی‌گرداند: نسخه‌ی اصلی (روی خود دامنه) + یک
+    نسخه به ازای هر «آی‌پی تمیز» ثبت‌شده در پنل. در نسخه‌های IP، فقط آدرس اتصال (قبل از @) عوض
+    می‌شود؛ Host/SNI/Path دقیقاً همون دامنه اصلی باقی می‌مانند تا هندشیک TLS سالم بماند."""
+    proto = link.get("protocol", DEFAULT_PROTOCOL)
+    label = link.get("label", "")
+    fp = link.get("fingerprint")
+    alpn = link.get("alpn")
+    port = link.get("port")
+    variants = [generate_vless_link(
+        uid, host, remark=f"X4G-{label}", protocol=proto, fingerprint=fp, alpn=alpn, port=port,
+    )]
+    for ip in CLEAN_IPS:
+        variants.append(generate_vless_link(
+            uid, host, remark=f"X4G-{label} [{ip}]", protocol=proto,
+            fingerprint=fp, alpn=alpn, port=port, address=ip,
+        ))
+    return variants
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
